@@ -25,6 +25,8 @@ zee/
  ├─ scripts/
  │   ├─ make_lr_from_aid.py
  │   ├─ worldstrat_filter_align.py
+ │   ├─ worldstrat_rgb_revisits_preview.py      # (추가) L2A 리비짓 RGB 진단/저장
+ │   ├─ resize_dataset_pairs.py                 # (추가) HR 600 / LR 150 리사이즈 표준화
  │   ├─ train_hat.py
  │   ├─ train_ttst.py
  │   └─ train_srcnn.py
@@ -55,17 +57,47 @@ zee/
 ### 3.2 WorldStrat (Pair: S2 10 m ↔ SPOT6/7 1.5 m)
 - **출처**: https://www.kaggle.com/datasets/jucor1/worldstrat
 - **이슈**: 센서/시간/구름/방사/정합 차이 → 전처리 필수
-- **파이프라인**
-  1) **HM vs NoHM**: 히스토그램 매칭 적용 여부 비교
-  2) **정합 품질**(기하):  
-     - `shift_mag ≤ <!-- TODO: px (권장 1.0) -->`, `ecc_cc ≥ <!-- TODO: (권장 0.5) -->`
-     - 특징점: **LightGlue + DISK**로 매칭 품질 기반 필터 (예: inlier 수, 매칭 점수 임계)
-  3) **난이도 필터**: **SSIM Top-40%** (split별 분포 기준)
-  4) **방사 일치**(스펙트럼 각): **RGB-SAD ≤ <!-- TODO: ° (권장 5°) -->**
-- **폴더 규칙**: `<split>/{GT,LR}/<tile>.png` (GT 600×600 / LR 150×150)
-- **필터 후 샘플 수**: <!-- TODO: train/val/test 남은 개수 기입 -->
 
-> 상세 지침/근거는 `data_cards/WorldStrat.md`에 정리.
+#### 3.2.1 파이프라인 단계 (요약)
+1) **RGB 밴드만 사용**  
+   - L2A 리비짓별 TIFF에서 (3,2,1) 채널을 선택해 RGB 구성 및 정규화/옵션 CLAHE.  
+   - 구현: `scripts/worldstrat_rgb_revisits_preview.py` (아래 사용법 참조).
+
+2) **리사이즈 표준화**  
+   - **HR → 600×600**, **LR → 150×150** 고정.  
+   - 구현: `scripts/resize_dataset_pairs.py` (아래 사용법 참조).
+
+3) **정합/방사/난이도 필터** (OpenSR 영감)
+   - **QA1(정합)**: LightGlue+DISK 특징점 매칭 기반, 변위 RMSE **≤ 0.75 LR px** (≈ 30 m×0.75).  
+   - **QA2(방사)**: 밴드별 HM 적용 후 **RGB-SAD ≤ 5°**.  
+   - **난이도**: HM/NoHM 각각에서 **SSIM Top-40%**(split별 분포 기준).
+
+4) **데이터 변형/분리**  
+   - train/val/test 분할 후 `<split>/{GT,LR}/<tile>.png` 구조로 저장.
+
+> 주의: Sentinel-2 밴드 순서/폭은 제공본에 따라 상이할 수 있음. (3,2,1)이 실제 RGB에 해당하는지 **사전 확인** 필요.
+
+#### 3.2.2 리비짓 진단/저장 스크립트 사용법
+```bash
+python scripts/worldstrat_rgb_revisits_preview.py \
+  --dataset_path /PATH/worldstrat/dataset \
+  --main_path    /PATH/worldstrat/dataset \
+  --hr_rel hr_dataset/12bit \
+  --lr_rel lr_dataset \
+  --max_samples 5 \
+  --apply_clahe 0
+```
+- 출력: `diagnostic_images_mini/`, `optimized_samples_mini/all_revisits/<AREA>/*.png`
+
+#### 3.2.3 리사이즈 표준화 스크립트 사용법
+```bash
+# HR 600 / LR 150으로 리사이즈 (동일 파일명 기준 매칭 저장)
+python scripts/resize_dataset_pairs.py \
+  --src_hr_dir /PATH/WorldStrat/train/GT \
+  --src_lr_dir /PATH/WorldStrat/train/LR \
+  --dst_root   /PATH/WorldStrat_resized/train \
+  --hr_size 600 --lr_size 150
+```
 
 ---
 
@@ -88,9 +120,48 @@ zee/
 
 ---
 
-## 5) 빠른 시작(Quickstart)
+## 5) 실험 (WorldStrat) – 설계 & 분석
 
-### 5.1 환경
+### 5.1 데이터셋 구성 (OpenSR 영감)
+- **Train**
+  - **good 6k**: 5,925 쌍 (QA1/QA2/난이도 필터 통과)
+  - **mix 6k**: 5,925 쌍 랜덤
+  - **mix 20k**: 20,382 쌍 전체
+- **Val**
+  - **val_mixed**: 1,000 쌍 (전체 2,590 중 good:drop 비율(≈292:708) 반영)
+  - **val_clean**: 456 쌍 (filtered)
+  - **val_all**: 2,590 쌍 (전체)
+- **평가 지표**: PSNR, SSIM
+
+> 참고: https://esaopensr.github.io/opensr-test/ — QA1: LightGlue+DISK, QA2: HM 후 SAD≤5°.
+
+### 5.2 Runpod 실험 설정
+- **Loss**: L1  
+- **GPU 0**
+  - train: **mix 20k**; val: val_mixed, val_clean, val_all; batch=6
+- **GPU 1 – (1)**
+  - train: **good 6k**; val: 동일; batch=3
+- **GPU 1 – (2)**
+  - train: **mix 6k**; val: 동일; batch=3
+
+### 5.3 핵심 결과 요약
+- **mix 20k**(필터링 없는 all)에서 **PSNR·SSIM 모두 최고** → **데이터 수량** 효과.
+- 다수 케이스에서 **mix 6k > good 6k**  
+  - 이유: **텍스처 다양성 상실**(good은 밭/초지/수면 등 저주파 편중), **도심 엣지/고주파 노출 감소**.
+- **인퍼런스 파이프라인**과 **학습 분포** 정렬이 중요:
+  - **NoHM 데이터에 쓸 모델** ⇒ **NoHM로 학습**이 유리(PSNR·SSIM).
+  - **HM 파이프라인(추론 시에도 HM 적용)** ⇒ **HM로 학습** 시 **SSIM 이득**. 단, **PSNR 목표**면 HM 단독 학습은 손해 가능.
+- **목표 함수에 따라 전략 분기**:  
+  - **SSIM 최적화** ⇒ HM 유리(특히 HM 검증셋).  
+  - **PSNR 최적화** ⇒ NoHM가 전반적으로 유리.
+
+> 상세 수치/그래프는 `reports/tables/*.csv`, `reports/figures/*.png` 참조.
+
+---
+
+## 6) 빠른 시작(Quickstart)
+
+### 6.1 환경
 ```bash
 # Conda (예시)
 conda env create -f env/rsisr.yaml
@@ -99,7 +170,7 @@ conda activate rsisr
 pip install -r env/requirements.txt
 ```
 
-### 5.2 데이터 준비
+### 6.2 데이터 준비
 ```text
 DATA_ROOT/
  ├─ AID/...
@@ -109,12 +180,26 @@ DATA_ROOT/
      └─ test/{GT,LR}
 ```
 
-### 5.3 전처리/필터 실행
+### 6.3 전처리/필터 실행
 ```bash
-python scripts/worldstrat_filter_align.py   --data_root <DATA_ROOT>/WorldStrat   --hm <on|off>   --shift_thr <px> --ecc_thr <val>   --ssim_topk 0.40   --sad_thr <deg>   --out_dir data/WorldStrat_filtered
+# (선택) 리비짓 RGB 진단/저장
+python scripts/worldstrat_rgb_revisits_preview.py \
+  --dataset_path /PATH/worldstrat/dataset \
+  --main_path    /PATH/worldstrat/dataset \
+  --hr_rel hr_dataset/12bit \
+  --lr_rel lr_dataset \
+  --max_samples 5 \
+  --apply_clahe 0
+
+# (선택) 페어 리사이즈 표준화 (HR 600 / LR 150)
+python scripts/resize_dataset_pairs.py \
+  --src_hr_dir /PATH/WorldStrat/train/GT \
+  --src_lr_dir /PATH/WorldStrat/train/LR \
+  --dst_root   /PATH/WorldStrat_resized/train \
+  --hr_size 600 --lr_size 150
 ```
 
-### 5.4 학습 / 검증
+### 6.4 학습 / 검증
 ```bash
 # HAT (예시)
 python scripts/train_hat.py -c configs/worldstrat_x4_hat.yml --wandb
@@ -127,44 +212,36 @@ python scripts/train_hat.py   -c configs/aid_x4_bicubic.yml
 
 ---
 
-## 6) 평가 설정
-- **지표**: PSNR↑, SSIM↑, LPIPS↓, DISTS↓, (선택) NIQE↓, MUSIQ↑, MANIQA↑
+## 7) 평가 설정
+- **지표**: PSNR↑, SSIM↑, (선택) LPIPS↓, DISTS↓, NIQE↓, MUSIQ↑, MANIQA↑
 - **채널**: Y (기본) / RGB (보고 시 명시)
 - **트랙**: **All** / **SSIM Top-40%** / **Strict-Align(ecc/shift/SAD)**
 
 ---
 
-## 7) 결과
-
-### 7.1 AID(x4) – 모델 비교 (RGB, test)
+## 8) 결과 표 (자리표시자)
+### 8.1 AID(x4) – 모델 비교 (RGB, test)
 | Model | PSNR | SSIM | LPIPS | DISTS |
 |------:|-----:|-----:|------:|------:|
 | SRCNN |      |      |       |       |
 | TTST  |      |      |       |       |
 | HAT   |      |      |       |       |
 
-### 7.2 WorldStrat(x4) – 전처리 트랙별 (HAT)
+### 8.2 WorldStrat(x4) – 전처리 트랙별 (HAT)
 | Track | PSNR | SSIM | LPIPS | DISTS | 비고 |
 |------|-----:|-----:|------:|------:|-----|
 | All            | | | | |  |
 | SSIM Top-40%   | | | | | 분포 40% 기준 |
-| Strict-Align   | | | | | shift≤…, ecc≥…, SAD≤… |
+| Strict-Align   | | | | | shift≤0.75px, SAD≤5° |
 
-> 시각화는 `reports/figures/` 참고 (LR↑ vs SR vs GT, 경계 확대 포함).
-
----
-
-## 8) 분석 & 논의
-- 엣지 모듈 → 경계 품질/LPIPS 영향
-- MAE 전이 → 저데이터 수렴/초기가속
-- Top-40%만 학습 시 **편향**과 실제 일반화 간 균형
+> 그래프/패널: `reports/figures/`
 
 ---
 
 ## 9) 한계 & 다음 과제
 - 센서/시간차로 인한 잔차
 - HM/NoHM 분포 편향
-- 다음: 엣지×MAE 조합, 도메인 어댑트, 하드케이스 증강
+- 다음: 엣지×MAE 조합, 도메인 어댑테이션, 하드케이스 증강
 
 ---
 
@@ -190,5 +267,6 @@ mkdocs gh-deploy
 - **데이터셋**
   - AID: https://github.com/YingdongKang/ACT_SR
   - WorldStrat: https://www.kaggle.com/datasets/jucor1/worldstrat
+- **참고**: OpenSR-Test (QA1/QA2 워크플로 영감)
 - **모델/코드베이스**: (HAT, TTST, 기타 참조 레포) <!-- TODO: 링크 기입 -->
 - **라이선스**: <!-- TODO -->
